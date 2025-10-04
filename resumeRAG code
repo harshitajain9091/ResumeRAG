@@ -1,0 +1,611 @@
+# ResumeRAG - FastAPI backend (single-file)
+# Files included in this single textdoc: main.py, requirements.txt, README.md
+# Save the section labeled `# --- main.py ---` into a file named main.py
+# Then create requirements.txt and README.md from their sections.
+
+# --- main.py ---
+"""
+Simple, judge-friendly FastAPI implementation for ResumeRAG.
+- Single-file for convenience: main.py
+- Uses SQLite (via SQLAlchemy) for persistence
+- Uses scikit-learn TfidfVectorizer as deterministic vector encoder (no external API)
+- In-memory rate limiting (60 req/min/user)
+- Basic idempotency table
+- ZIP bulk upload support
+- PII redaction (emails, phones)
+
+Run:
+    pip install -r requirements.txt
+    uvicorn main:app --reload
+
+This is intended as a scaffold for hackathon/judge. It's not production-ready.
+"""
+
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Depends, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+import uvicorn
+import os
+import shutil
+import uuid
+import zipfile
+import re
+import json
+import time
+from hashlib import sha256
+from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, Table, ForeignKey
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+from sqlalchemy.types import JSON as SAJSON
+from datetime import datetime, timedelta
+from passlib.context import CryptContext
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+# -------------------
+# Config
+# -------------------
+DB_URL = "sqlite:///./resumerag.db"
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# -------------------
+# DB Setup
+# -------------------
+Base = declarative_base()
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Idempotency table
+class Idempotency(Base):
+    __tablename__ = "idempotency"
+    key = Column(String, primary_key=True)
+    user = Column(String, primary_key=False)
+    endpoint = Column(String)
+    response = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    email = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    role = Column(String, default="user")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Resume(Base):
+    __tablename__ = "resumes"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    filename = Column(String)
+    parsed_text = Column(Text)
+    redacted_text = Column(Text)
+    skills = Column(Text)  # json array
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Job(Base):
+    __tablename__ = "jobs"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    title = Column(String)
+    description = Column(Text)
+    requirements = Column(Text)  # json array
+    preferred = Column(Text)  # json array
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Chunk(Base):
+    __tablename__ = "chunks"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    resume_id = Column(String, ForeignKey("resumes.id"))
+    text = Column(Text)
+    start_idx = Column(Integer)
+    end_idx = Column(Integer)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+Base.metadata.create_all(bind=engine)
+
+# -------------------
+# App
+# -------------------
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["*"], allow_credentials=True)
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
+
+# -------------------
+# Simple auth (JWT-like toy tokens)
+# -------------------
+SECRET = "dev-secret-key"
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(password: str, hashed: str) -> bool:
+    return pwd_context.verify(password, hashed)
+
+def create_token(user_id: str) -> str:
+    # toy token: user_id|expiry|sig
+    exp = int(time.time()) + 60 * 60 * 6
+    payload = f"{user_id}|{exp}"
+    sig = sha256((payload + SECRET).encode()).hexdigest()
+    return f"{payload}|{sig}"
+
+def decode_token(token: str) -> Optional[str]:
+    try:
+        user_id, exp, sig = token.split("|")
+        payload = f"{user_id}|{exp}"
+        if sha256((payload + SECRET).encode()).hexdigest() != sig:
+            return None
+        if int(exp) < int(time.time()):
+            return None
+        return user_id
+    except Exception:
+        return None
+
+def get_user_by_id(db, uid: str):
+    return db.query(User).filter(User.id == uid).first()
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    uid = decode_token(token)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    db = SessionLocal()
+    user = get_user_by_id(db, uid)
+    db.close()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid user")
+    return user
+
+# -------------------
+# Rate limiting (in-memory)
+# -------------------
+RATE_LIMIT = 60  # per minute
+_user_counters: Dict[str, Dict[str, Any]] = {}
+
+def check_rate_limit(user_identifier: str):
+    now = time.time()
+    window = 60
+    rec = _user_counters.get(user_identifier)
+    if not rec:
+        _user_counters[user_identifier] = {"count": 1, "start": now}
+        return True
+    if now - rec["start"] > window:
+        _user_counters[user_identifier] = {"count": 1, "start": now}
+        return True
+    if rec["count"] >= RATE_LIMIT:
+        return False
+    rec["count"] += 1
+    return True
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    # identify by user token if present, otherwise by client host
+    token = request.headers.get("authorization")
+    if token and token.lower().startswith("bearer "):
+        tok = token.split()[1]
+        uid = decode_token(tok) or "anon"
+    else:
+        # fallback to client host
+        uid = request.client.host
+    ok = check_rate_limit(uid)
+    if not ok:
+        return JSONResponse(status_code=429, content={"error": {"code":"RATE_LIMIT"}})
+    return await call_next(request)
+
+# -------------------
+# Utilities: PII redaction, chunking, skills
+# -------------------
+email_re = re.compile(r"[a-zA-Z0-9+._%-]+@[a-zA-Z0-9._%-]+\.[a-zA-Z]{2,}")
+phone_re = re.compile(r"(\+?\d[\d\-\s]{7,}\d)")
+
+def redact_pii(text: str) -> str:
+    t = email_re.sub("[REDACTED_EMAIL]", text)
+    t = phone_re.sub("[REDACTED_PHONE]", t)
+    return t
+
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
+    chunks = []
+    i = 0
+    L = len(text)
+    while i < L:
+        start = i
+        end = min(i + chunk_size, L)
+        chunks.append((start, end, text[start:end]))
+        i = end - overlap
+        if i <= start:
+            break
+    return chunks
+
+skill_candidates = ["python","django","flask","postgresql","kafka","docker","kubernetes","aws","terraform","react","tensorflow","pytorch","spark","node.js","node","typescript","reactjs"]
+
+def extract_skills(text: str):
+    txt = text.lower()
+    found = []
+    for s in skill_candidates:
+        if s in txt:
+            found.append(s)
+    return found
+
+# -------------------
+# Vector store (TF-IDF)
+# -------------------
+# For simplicity we retrain vectorizer on all chunks when new upload happens.
+_vectorizer = None
+_chunk_vectors = None  # numpy array NxM
+_chunk_ids = []
+
+def rebuild_vectors():
+    global _vectorizer, _chunk_vectors, _chunk_ids
+    db = SessionLocal()
+    chunks = db.query(Chunk).all()
+    texts = [c.text for c in chunks]
+    ids = [c.id for c in chunks]
+    if len(texts) == 0:
+        _vectorizer = None
+        _chunk_vectors = None
+        _chunk_ids = []
+    else:
+        _vectorizer = TfidfVectorizer(lowercase=True, stop_words='english')
+        X = _vectorizer.fit_transform(texts)
+        _chunk_vectors = X.toarray()
+        _chunk_ids = ids
+    db.close()
+
+def query_top_k(query: str, k: int = 5):
+    if not _vectorizer or _chunk_vectors is None:
+        return []
+    qv = _vectorizer.transform([query]).toarray()
+    sims = cosine_similarity(qv, _chunk_vectors)[0]
+    idx = np.argsort(-sims)[:k]
+    results = []
+    db = SessionLocal()
+    for i in idx:
+        cid = _chunk_ids[i]
+        score = float(sims[i])
+        chunk = db.query(Chunk).filter(Chunk.id == cid).first()
+        if chunk:
+            results.append({"chunk_id": cid, "resume_id": chunk.resume_id, "snippet": chunk.text, "start": chunk.start_idx, "end": chunk.end_idx, "score": score})
+    db.close()
+    return results
+
+# -------------------
+# Helper: idempotency
+# -------------------
+
+def get_idempotency(key: str, user: str, endpoint: str):
+    if not key:
+        return None
+    db = SessionLocal()
+    rec = db.query(Idempotency).filter(Idempotency.key == key, Idempotency.user == user, Idempotency.endpoint == endpoint).first()
+    db.close()
+    return rec
+
+def set_idempotency(key: str, user: str, endpoint: str, response: dict):
+    if not key:
+        return
+    db = SessionLocal()
+    rec = Idempotency(key=key, user=user, endpoint=endpoint, response=json.dumps(response))
+    db.add(rec)
+    db.commit()
+    db.close()
+
+# -------------------
+# Schemas
+# -------------------
+class RegisterIn(BaseModel):
+    email: str
+    password: str
+    role: Optional[str] = "user"
+
+class TokenOut(BaseModel):
+    token: str
+
+class ResumeOut(BaseModel):
+    id: str
+    filename: str
+    skills: List[str]
+    created_at: datetime
+
+class AskIn(BaseModel):
+    query: str
+    k: Optional[int] = 5
+
+# -------------------
+# Auth endpoints
+# -------------------
+@app.post("/api/register", response_model=TokenOut)
+def register(payload: RegisterIn):
+    db = SessionLocal()
+    if db.query(User).filter(User.email == payload.email).first():
+        db.close()
+        raise HTTPException(status_code=400, detail={"error": {"code":"EMAIL_TAKEN", "field":"email", "message":"Email already registered"}})
+    user = User(email=payload.email, password_hash=hash_password(payload.password), role=payload.role)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    token = create_token(user.id)
+    db.close()
+    return {"token": token}
+
+@app.post("/api/login", response_model=TokenOut)
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    db = SessionLocal()
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.password_hash):
+        db.close()
+        raise HTTPException(status_code=401, detail={"error": {"code":"INVALID_CREDENTIALS", "message":"Invalid credentials"}})
+    token = create_token(user.id)
+    db.close()
+    return {"token": token}
+
+# -------------------
+# Resume endpoints
+# -------------------
+@app.post("/api/resumes")
+async def upload_resume(file: UploadFile = File(...), idempotency_key: Optional[str] = Header(None), current_user: User = Depends(get_current_user)):
+    # idempotency check
+    prev = get_idempotency(idempotency_key, current_user.id if current_user else "anon", "/api/resumes")
+    if prev:
+        return JSONResponse(status_code=200, content=json.loads(prev.response))
+
+    # save file to uploads
+    fn = f"{uuid.uuid4()}_{file.filename}"
+    path = os.path.join(UPLOAD_DIR, fn)
+    with open(path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    created_ids = []
+    # if zip, extract
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path, 'r') as z:
+            for name in z.namelist():
+                if name.endswith('/'):
+                    continue
+                data = z.read(name)
+                subfn = f"{uuid.uuid4()}_{os.path.basename(name)}"
+                subpath = os.path.join(UPLOAD_DIR, subfn)
+                with open(subpath, "wb") as sf:
+                    sf.write(data)
+                rid = process_file(subpath)
+                created_ids.append(rid)
+    else:
+        rid = process_file(path)
+        created_ids.append(rid)
+
+    resp = {"created": created_ids}
+    set_idempotency(idempotency_key, current_user.id if current_user else "anon", "/api/resumes", resp)
+    return JSONResponse(status_code=201, content=resp)
+
+def process_file(path: str) -> str:
+    # naive text extraction: if .txt read, else attempt to decode as utf-8
+    name = os.path.basename(path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        # binary fallback
+        with open(path, "rb") as f:
+            raw = f.read()
+            try:
+                text = raw.decode('utf-8')
+            except Exception:
+                text = ""
+    if not text:
+        text = name
+    redacted = redact_pii(text)
+    skills = extract_skills(text)
+    db = SessionLocal()
+    r = Resume(filename=name, parsed_text=text, redacted_text=redacted, skills=json.dumps(skills))
+    db.add(r)
+    db.commit()
+    db.refresh(r)
+    # chunk and save
+    chunks = chunk_text(text)
+    for (start, end, snippet) in chunks:
+        c = Chunk(resume_id=r.id, text=snippet, start_idx=start, end_idx=end)
+        db.add(c)
+    db.commit()
+    db.close()
+    # rebuild vectors
+    rebuild_vectors()
+    return r.id
+
+@app.get("/api/resumes")
+def list_resumes(limit: int = 20, offset: int = 0, q: Optional[str] = None, current_user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    qobj = db.query(Resume)
+    if q:
+        qlow = q.lower()
+        qobj = qobj.filter(Resume.parsed_text.ilike(f"%{qlow}%"))
+    total = qobj.count()
+    items = qobj.order_by(Resume.created_at.desc()).offset(offset).limit(limit).all()
+    next_offset = offset + len(items) if offset + len(items) < total else None
+    out = []
+    for it in items:
+        snippet = it.redacted_text[:200]
+        out.append({"id": it.id, "filename": it.filename, "snippet": snippet, "skills": json.loads(it.skills or "[]"), "created_at": it.created_at.isoformat()})
+    db.close()
+    return {"items": out, "next_offset": next_offset}
+
+@app.get("/api/resumes/{resume_id}")
+def get_resume(resume_id: str, reveal_pii: bool = False, current_user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    r = db.query(Resume).filter(Resume.id == resume_id).first()
+    if not r:
+        db.close()
+        raise HTTPException(status_code=404, detail={"error": {"code":"NOT_FOUND", "message":"Resume not found"}})
+    # recruiters can reveal
+    if reveal_pii and current_user.role == 'recruiter':
+        text = r.parsed_text
+    else:
+        text = r.redacted_text
+    out = {"id": r.id, "filename": r.filename, "text": text, "skills": json.loads(r.skills or "[]"), "created_at": r.created_at.isoformat()}
+    db.close()
+    return out
+
+# -------------------
+# Ask endpoint (RAG)
+# -------------------
+@app.post("/api/ask")
+def ask(payload: AskIn, current_user: User = Depends(get_current_user)):
+    k = payload.k or 5
+    tops = query_top_k(payload.query, k)
+    # assemble answer: naive aggregation
+    if not tops:
+        return {"answer": "No relevant snippets found.", "sources": []}
+    answer_lines = []
+    sources = []
+    for t in tops:
+        snippet = t["snippet"]
+        # redact unless recruiter
+        if current_user.role != 'recruiter':
+            snippet = redact_pii(snippet)
+        sources.append({"resume_id": t["resume_id"], "snippet": snippet, "start": t["start"], "end": t["end"], "score": t["score"]})
+        answer_lines.append(snippet)
+    answer = "\n---\n".join(answer_lines)
+    return {"answer": answer, "sources": sources}
+
+# -------------------
+# Jobs endpoints
+# -------------------
+@app.post("/api/jobs")
+def create_job(body: Dict[str, Any], idempotency_key: Optional[str] = Header(None), current_user: User = Depends(get_current_user)):
+    prev = get_idempotency(idempotency_key, current_user.id if current_user else "anon", "/api/jobs")
+    if prev:
+        return JSONResponse(status_code=200, content=json.loads(prev.response))
+    title = body.get('title')
+    description = body.get('description')
+    requirements = body.get('requirements') or []
+    preferred = body.get('preferred') or []
+    if not title:
+        raise HTTPException(status_code=400, detail={"error": {"code":"FIELD_REQUIRED", "field":"title", "message":"Title required"}})
+    db = SessionLocal()
+    j = Job(title=title, description=description or "", requirements=json.dumps(requirements), preferred=json.dumps(preferred))
+    db.add(j)
+    db.commit()
+    db.refresh(j)
+    db.close()
+    resp = {"id": j.id, "title": j.title}
+    set_idempotency(idempotency_key, current_user.id if current_user else "anon", "/api/jobs", resp)
+    return resp
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str, current_user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    j = db.query(Job).filter(Job.id == job_id).first()
+    if not j:
+        db.close()
+        raise HTTPException(status_code=404, detail={"error": {"code":"NOT_FOUND", "message":"Job not found"}})
+    out = {"id": j.id, "title": j.title, "description": j.description, "requirements": json.loads(j.requirements or "[]"), "preferred": json.loads(j.preferred or "[]")}
+    db.close()
+    return out
+
+@app.post("/api/jobs/{job_id}/match")
+def match_job(job_id: str, payload: Dict[str, Any], current_user: User = Depends(get_current_user)):
+    top_n = int(payload.get('top_n', 10))
+    db = SessionLocal()
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        db.close()
+        raise HTTPException(status_code=404, detail={"error": {"code":"NOT_FOUND", "message":"Job not found"}})
+    requirements = json.loads(job.requirements or "[]")
+    resumes = db.query(Resume).all()
+    matches = []
+    for r in resumes:
+        score = 0.0
+        evidence = []
+        text_lower = r.parsed_text.lower()
+        for req in requirements:
+            if req.lower() in text_lower:
+                score += 1.0
+                # find sentence with requirement
+                sentences = re.split(r"(?<=[.!?])\\s+", r.parsed_text)
+                for s in sentences:
+                    if req.lower() in s.lower():
+                        snip = s.strip()
+                        if current_user.role != 'recruiter':
+                            snip = redact_pii(snip)
+                        evidence.append({"snippet": snip, "requirement_matched": req})
+                        break
+        # normalize score by number of requirements
+        if requirements:
+            score = score / max(1, len(requirements))
+        if evidence:
+            # deterministic tiebreaker
+            tie = int(sha256(r.id.encode()).hexdigest()[:8], 16)
+            matches.append({"resume_id": r.id, "score": float(score), "evidence": evidence, "missing_requirements": [req for req in requirements if req.lower() not in text_lower], "tie": tie})
+    # sort by score desc, then tie asc to be deterministic
+    matches = sorted(matches, key=lambda x: (-x['score'], x['tie']))[:top_n]
+    # remove tie from output
+    for m in matches:
+        del m['tie']
+    db.close()
+    return {"matches": matches}
+
+# -------------------
+# Seed data helper
+# -------------------
+def seed_if_empty():
+    db = SessionLocal()
+    if db.query(User).count() == 0:
+        u = User(email="judge@resumerag.test", password_hash=hash_password("Test1234!"), role='recruiter')
+        v = User(email="user@resumerag.test", password_hash=hash_password("Test1234!"), role='user')
+        db.add_all([u, v])
+        db.commit()
+    if db.query(Job).count() == 0:
+        jobs = [
+            Job(title="Frontend Engineer", description="React, Typescript, CSS", requirements=json.dumps(["React","Typescript"]), preferred=json.dumps(["Next.js"])),
+            Job(title="Data Scientist", description="Python, ML", requirements=json.dumps(["Python","TensorFlow"]), preferred=json.dumps(["PyTorch"])),
+            Job(title="DevOps Engineer", description="Kubernetes, Terraform", requirements=json.dumps(["Kubernetes","Terraform"]), preferred=json.dumps(["AWS"]))
+        ]
+        db.add_all(jobs)
+        db.commit()
+    # seed resumes folder small
+    if db.query(Resume).count() == 0:
+        samples = [
+            ("r_john_doe.txt", "John Doe\nEmail: john.doe@example.com\nExperience: 5 years as Backend Engineer. Skills: Python, Django, Flask, PostgreSQL, Kafka, Docker, Kubernetes. Projects: Real-time ETL pipelines using Kafka and Spark Streaming."),
+            ("r_jane_smith.txt", "Jane Smith\nEmail: jane.smith@sample.org\nExperience: 3 years Data Scientist. Skills: Python, pandas, scikit-learn, TensorFlow, PyTorch."),
+            ("r_rahul_sharma.txt", "Rahul Sharma\nEmail: rahul.sharma@mail.in\nExperience: 6 years DevOps. Skills: AWS, Terraform, Docker, Kubernetes, Prometheus."),
+            ("r_maria_garcia.txt", "Maria Garcia\nEmail: maria.garcia@example.es\nFrontend: React, Typescript, CSS, HTML, Next.js. Experience: 4 years."),
+            ("r_alan_kim.txt", "Alan Kim\nEmail: alan.kim@example.co.kr\nFullstack: Node.js, Express, React, MongoDB. Experience: 5 years.")
+        ]
+        for fn, txt in samples:
+            path = os.path.join(UPLOAD_DIR, fn)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(txt)
+            process_file(path)
+    db.close()
+
+seed_if_empty()
+
+# -------------------
+# Run app
+# -------------------
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+# --- requirements.txt ---
+# fastapi
+# uvicorn[standard]
+# sqlalchemy
+# passlib[bcrypt]
+# pydantic
+# scikit-learn
+
+# --- README.md ---
+# ResumeRAG - FastAPI scaffold
+
+# Quickstart
+
+# 1. Install
+#    pip install -r requirements.txt
+# 2. Run
+#    uvicorn main:app --reload
+# 3. Test credentials
+#    judge@resumerag.test / Test1234! (recruiter)
+#    user@resumerag.test / Test1234! (user)
+
+# End of single-file project
